@@ -15,3 +15,7 @@ hex = "0.4.3"
 ed25519-dalek = "2.1.1"
 x25519-dalek = "2.0.1"
 rand = "0.8.5"
+aes-gcm = "0.10.3"
+
+[patch.crates-io]
+pqc_dilithium = { git = "https://github.com/kibernetikos/dilithium", rev="b7106801cf1d2797950f3fda50b7526278fc3ae0" }

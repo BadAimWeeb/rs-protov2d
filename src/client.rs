@@ -1,3 +1,4 @@
+use ed25519_dalek::ed25519::signature::SignerMut;
 use sha2::{Digest, Sha256};
 use x25519_dalek::EphemeralSecret;
 
@@ -5,7 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use crate::utils::{self, PRIVATE_KEY_LENGTH, PUBLIC_KEY_LENGTH};
+use crate::utils::{self, aes_encrypt, PRIVATE_KEY_LENGTH, PUBLIC_KEY_LENGTH};
 
 #[derive(PartialEq)]
 pub enum PublicKeyType {
@@ -34,13 +35,13 @@ pub enum Error {
     ExchangeError,
 }
 
-pub struct Client {
+pub struct BareClient {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     session: ([u8; PRIVATE_KEY_LENGTH], [u8; PUBLIC_KEY_LENGTH]),
     pub config: ClientHandshakeConfig
 }
 
-impl Client {
+impl BareClient {
     pub async fn handshake(&mut self) -> Result<(), Error> {
         let no_verify = self.config
             .public_keys
@@ -201,11 +202,52 @@ impl Client {
                         .diffie_hellman(&classic_exchange_public)
                         .to_bytes();
 
-                    // TODO
+                    let priv_session_classic = &self.session.0[0..32].try_into().map_err(|_| Error::InvalidDataHandshake)?;
+                    let mut priv_session_classic = ed25519_dalek::SigningKey::from_bytes(priv_session_classic);
+                    let signature_session_classic = priv_session_classic.sign(random_challenge);
+                    let signature_session_classic = signature_session_classic.to_bytes();
+                    
+                    let priv_session_pqc = &self.session.0[64..];
+                    let pub_session_pqc = &self.session.1[32..];
+                    let key_session_pqc = pqc_dilithium::Keypair::new(pub_session_pqc.to_vec(), priv_session_pqc.to_vec());
+                    if key_session_pqc.is_err() {
+                        return Err(Error::ExchangeError);
+                    }
+                    let key_session_pqc = key_session_pqc.ok();
+                    let key_session_pqc = key_session_pqc.unwrap();
+                    let signature_session_pqc = key_session_pqc.sign(random_challenge);
+
+                    let mut response = vec![0x02u8, 0x03];
+                    response.extend_from_slice(classic_public.as_bytes());
+                    response.extend_from_slice(&pq_data.0);
+                    
+                    let mut enc_response = vec![];
+                    enc_response.extend_from_slice(&self.session.1);
+                    enc_response.extend_from_slice(&signature_session_classic);
+                    enc_response.extend_from_slice(&signature_session_pqc);
+
+                    let aes_l1 = aes_encrypt(&encryption_pqc, &enc_response);
+                    if aes_l1.is_err() {
+                        return Err(Error::ExchangeError);
+                    }
+                    let aes_l1 = aes_l1.unwrap();
+
+                    let aes_l2 = aes_encrypt(&encryption_classic, &aes_l1);
+                    if aes_l2.is_err() {
+                        return Err(Error::ExchangeError);
+                    }
+                    let aes_l2 = aes_l2.unwrap();
+
+                    response.extend_from_slice(&aes_l2);
+
+                    self.ws.send(Message::binary(response)).await.map_err(|_| Error::WebsocketError)?;
+                    break;
                 }
             }
         }
 
-        Ok()
+        // TODO: handle final packet and start data exchange
+
+        Ok(())
     }
 }
