@@ -1,12 +1,14 @@
+use std::{collections::HashMap, task::Poll};
+
 use ed25519_dalek::ed25519::signature::SignerMut;
 use sha2::{Digest, Sha256};
 use x25519_dalek::EphemeralSecret;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::FusedStream, FutureExt, Sink, SinkExt, Stream, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use crate::utils::{self, aes_encrypt, PRIVATE_KEY_LENGTH, PUBLIC_KEY_LENGTH};
+use crate::utils::{self, aes_decrypt, aes_encrypt, PRIVATE_KEY_LENGTH, PUBLIC_KEY_LENGTH};
 
 #[derive(PartialEq)]
 pub enum PublicKeyType {
@@ -35,15 +37,196 @@ pub enum Error {
     ExchangeError,
 }
 
+pub struct ProtoV2dPacket {
+    pub qos: u8,
+    pub data: Vec<u8>
+}
+
 pub struct BareClient {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     session: ([u8; PRIVATE_KEY_LENGTH], [u8; PUBLIC_KEY_LENGTH]),
-    pub config: ClientHandshakeConfig
+
+    encryption: Option<([u8; 32], [u8; 32])>,
+    handshaked: bool,
+
+    pub track_count: usize,
+    pub config: ClientHandshakeConfig,
+
+    qos1_track_in: HashMap<u64, bool>,
+    qos1_track_out: HashMap<u64, Vec<u8>>,
+    last_ping: u64
+}
+
+impl Stream for BareClient {
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if !self.handshaked {
+            return Poll::Ready(None);
+        }
+
+        if !self.ws.is_terminated() {
+            return Poll::Ready(None);
+        }
+
+        if !self.encryption.is_none() {
+            return Poll::Ready(None);
+        }
+
+        match futures_util::ready!(self.ws.next().poll_unpin(cx)) {
+            Some(Ok(msg)) => {
+                if msg.is_close() {
+                    return Poll::Ready(None);
+                }
+
+                if msg.is_binary() || msg.is_text() {
+                    let d = msg.into_data();
+
+                    match d[0] {
+                        0x03 => {
+                            // Data packet
+                            let k = self.encryption.as_ref().unwrap();
+
+                            let enc_data = &d[1..];
+                            let data = aes_decrypt(&k.1, enc_data);
+                            if data.is_err() {
+                                return Poll::Ready(None);
+                            }
+
+                            let data = data.unwrap();
+                            let data = aes_decrypt(&k.0, &data);
+
+                            if data.is_err() {
+                                return Poll::Ready(None);
+                            }
+
+                            let data = data.unwrap();
+                            let data = data.as_slice();
+
+                            let qos = data[0];
+                            match qos {
+                                0x00 => {
+                                    let data = &data[1..];
+                                    return Poll::Ready(Some(ProtoV2dPacket { qos, data: data.to_vec() }));
+                                }
+
+                                0x01 => {
+                                    let dup_id = (u64::from(data[1]) << 24) |
+                                        (u64::from(data[2]) << 16) |
+                                        (u64::from(data[3]) << 8) |
+                                        u64::from(data[4]);
+
+                                    let control = data[5];
+
+                                    match control {
+                                        0xFF => {
+                                            // ACK
+                                            self.qos1_track_out.remove(&dup_id);
+                                        }
+                                        _ => {
+                                            // Data
+                                            let t_data = &data[6..];
+
+                                            let mut resp = vec![0x03u8];
+                                            let enc_part = vec![0x01u8, data[1], data[2], data[3], data[4], 0xFF];
+                                            let enc_part = aes_encrypt(&k.0, &enc_part);
+                                            if enc_part.is_err() {
+                                                return Poll::Ready(None);
+                                            }
+                                            let enc_part = enc_part.unwrap();
+                                            let enc_part = aes_encrypt(&k.1, &enc_part);
+                                            if enc_part.is_err() {
+                                                return Poll::Ready(None);
+                                            }
+                                            let enc_part = enc_part.unwrap();
+                                            resp.extend_from_slice(&enc_part);
+
+                                            let _ = self.ws.send(Message::binary(resp));
+
+                                            if !self.qos1_track_in.contains_key(&dup_id) {
+                                                self.qos1_track_in.insert(dup_id, true);
+                                                return Poll::Ready(Some(ProtoV2dPacket { qos, data: t_data.to_vec() }));
+                                            }
+
+                                            return Poll::Ready(None);
+                                        }
+                                    }
+                                }
+
+                                _ => {
+                                    return Poll::Ready(None);
+                                }
+                            }
+                        }
+                        0x04 => {
+                            // Ping
+                            if d[1] != 0x00 {
+                                return Poll::Ready(None);
+                            }
+
+                            let mut resp = vec![0x04u8, 0x01];
+                            resp.extend_from_slice(&d[2..]);
+                            let _ = self.ws.send(Message::binary(resp));
+
+                            return Poll::Ready(None);
+                        }
+                        0x05 => {
+                            todo!("implement graceful closing");
+                        }
+                        _ => {
+                            return Poll::Ready(None);
+                        }
+                    }
+                }
+
+                return Poll::Ready(None);
+            }
+            Some(Err(_)) => {
+                return Poll::Ready(None);
+            }
+            None => {
+                return Poll::Ready(None);
+            }
+        }
+    }
+
+    type Item = ProtoV2dPacket;
+}
+
+impl Sink<ProtoV2dPacket> for BareClient {
+    type Error = Error;
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        todo!()
+    }
+
+    fn start_send(self: std::pin::Pin<&mut Self>, item: ProtoV2dPacket) -> Result<(), Self::Error> {
+        todo!()
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        todo!()
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        todo!()
+    }
 }
 
 impl BareClient {
     pub async fn handshake(&mut self) -> Result<(), Error> {
-        let no_verify = self.config
+        let no_verify = self
+            .config
             .public_keys
             .iter()
             .any(|k| k.key_type == PublicKeyType::NoVerify);
@@ -65,8 +248,8 @@ impl BareClient {
             return Err(Error::WebsocketError);
         }
 
-        let mut encryption_pqc;
-        let mut encryption_classic;
+        let encryption_pqc;
+        let encryption_classic;
 
         // Wait for response from handshake request
         loop {
@@ -202,14 +385,20 @@ impl BareClient {
                         .diffie_hellman(&classic_exchange_public)
                         .to_bytes();
 
-                    let priv_session_classic = &self.session.0[0..32].try_into().map_err(|_| Error::InvalidDataHandshake)?;
-                    let mut priv_session_classic = ed25519_dalek::SigningKey::from_bytes(priv_session_classic);
+                    let priv_session_classic = &self.session.0[0..32]
+                        .try_into()
+                        .map_err(|_| Error::InvalidDataHandshake)?;
+                    let mut priv_session_classic =
+                        ed25519_dalek::SigningKey::from_bytes(priv_session_classic);
                     let signature_session_classic = priv_session_classic.sign(random_challenge);
                     let signature_session_classic = signature_session_classic.to_bytes();
-                    
+
                     let priv_session_pqc = &self.session.0[64..];
                     let pub_session_pqc = &self.session.1[32..];
-                    let key_session_pqc = pqc_dilithium::Keypair::new(pub_session_pqc.to_vec(), priv_session_pqc.to_vec());
+                    let key_session_pqc = pqc_dilithium::Keypair::new(
+                        pub_session_pqc.to_vec(),
+                        priv_session_pqc.to_vec(),
+                    );
                     if key_session_pqc.is_err() {
                         return Err(Error::ExchangeError);
                     }
@@ -220,7 +409,7 @@ impl BareClient {
                     let mut response = vec![0x02u8, 0x03];
                     response.extend_from_slice(classic_public.as_bytes());
                     response.extend_from_slice(&pq_data.0);
-                    
+
                     let mut enc_response = vec![];
                     enc_response.extend_from_slice(&self.session.1);
                     enc_response.extend_from_slice(&signature_session_classic);
@@ -240,13 +429,52 @@ impl BareClient {
 
                     response.extend_from_slice(&aes_l2);
 
-                    self.ws.send(Message::binary(response)).await.map_err(|_| Error::WebsocketError)?;
+                    self.ws
+                        .send(Message::binary(response))
+                        .await
+                        .map_err(|_| Error::WebsocketError)?;
                     break;
                 }
             }
         }
 
-        // TODO: handle final packet and start data exchange
+        loop {
+            let msg = self.ws.next().await;
+
+            if let Some(Err(_)) = msg {
+                let _ = self.ws.close(None).await;
+                return Err(Error::WebsocketError);
+            }
+
+            if let Some(Ok(msg)) = msg {
+                if msg.is_close() {
+                    return Err(Error::ConnectionClosed);
+                }
+
+                if msg.is_binary() || msg.is_text() {
+                    let d = msg.into_data();
+
+                    if d[0] != 0x02 {
+                        return Err(Error::InvalidDataHandshake);
+                    }
+
+                    if d[1] != 0x04 {
+                        return Err(Error::InvalidDataHandshake);
+                    }
+
+                    self.handshaked = true;
+
+                    let resumed = d[2] == 0x00;
+                    if !resumed {
+                        self.track_count += 1;
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        self.encryption = Some((encryption_pqc, encryption_classic));
 
         Ok(())
     }

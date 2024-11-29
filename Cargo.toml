@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 futures-util = "0.3.31"
-tokio = { version = "1.41.1", features = ["net"] }
+tokio = { version = "1.41.1", features = ["net", "rt"] }
 tokio-tungstenite = "0.24.0"
 pqc_kyber = {version = "0.7.1", features = ["std", "kyber1024", "zeroize"]}
 pqc_dilithium = { version = "0.2.0", features = ["mode5"]}
