@@ -19,3 +19,7 @@ aes-gcm = "0.10.3"
 
 [patch.crates-io]
 pqc_dilithium = { git = "https://github.com/kibernetikos/dilithium", rev="b7106801cf1d2797950f3fda50b7526278fc3ae0" }
+
+[dependencies.criterion]
+version = "0.4.0"
+optional = true
