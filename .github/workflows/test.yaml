@@ -10,7 +10,7 @@ jobs:
       matrix:
         rust:
           - stable
-          - stable 18 months ago
+          - 1.70.0
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
