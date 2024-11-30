@@ -10,18 +10,14 @@ jobs:
       matrix:
         rust:
           - stable
+          - stable 18 months ago
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
-          override: true
 
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        env:
-          CI: false
-        with:
-          command: test
+        run: cargo test --all-features
