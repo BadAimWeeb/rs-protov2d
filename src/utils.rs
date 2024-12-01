@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use aes_gcm::aead::generic_array::typenum::U16;
 use aes_gcm::aead::AeadMutInPlace;
 use aes_gcm::Nonce;
-use aes_gcm::{aead::Aead, aes::Aes256, KeyInit};
+use aes_gcm::{aes::Aes256, KeyInit};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
@@ -23,30 +23,32 @@ pub fn compare(a: &[u8], b: &[u8]) -> cmp::Ordering {
 
 pub const PRIVATE_KEY_LENGTH: usize = ed25519_dalek::SECRET_KEY_LENGTH
     + ed25519_dalek::PUBLIC_KEY_LENGTH
-    + pqc_dilithium::SECRETKEYBYTES;
+    + crystals_dilithium::dilithium5::SECRETKEYBYTES;
 pub const PUBLIC_KEY_LENGTH: usize =
-    ed25519_dalek::PUBLIC_KEY_LENGTH + pqc_dilithium::PUBLICKEYBYTES;
+    ed25519_dalek::PUBLIC_KEY_LENGTH + crystals_dilithium::dilithium5::PUBLICKEYBYTES;
 
 pub fn generate_key() -> ([u8; PRIVATE_KEY_LENGTH], [u8; PUBLIC_KEY_LENGTH]) {
-    let pq = pqc_dilithium::Keypair::generate();
+    let mut pq_seed = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut pq_seed);
+    let pq = crystals_dilithium::dilithium5::Keypair::generate(Some(&pq_seed));
 
     let mut classic_seed = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut classic_seed);
     let classic_sign = ed25519_dalek::SigningKey::from_bytes(&classic_seed);
     let classic_public = classic_sign.verifying_key();
 
-    let pq_secret = pq.expose_secret();
-    let pq_public = pq.public;
+    let pq_secret = pq.secret.bytes;
+    let pq_public = pq.public.bytes;
 
     let mut priv_key = [0u8; PRIVATE_KEY_LENGTH];
     let mut pub_key = [0u8; PUBLIC_KEY_LENGTH];
 
     priv_key[..ed25519_dalek::SECRET_KEY_LENGTH].copy_from_slice(&classic_seed);
     priv_key[ed25519_dalek::SECRET_KEY_LENGTH
-        ..ed25519_dalek::SECRET_KEY_LENGTH + ed25519_dalek::PUBLIC_KEY_LENGTH]
+        ..(ed25519_dalek::SECRET_KEY_LENGTH + ed25519_dalek::PUBLIC_KEY_LENGTH)]
         .copy_from_slice(classic_public.as_bytes());
-    priv_key[ed25519_dalek::SECRET_KEY_LENGTH + ed25519_dalek::PUBLIC_KEY_LENGTH..]
-        .copy_from_slice(pq_secret);
+    priv_key[(ed25519_dalek::SECRET_KEY_LENGTH + ed25519_dalek::PUBLIC_KEY_LENGTH)..]
+        .copy_from_slice(&pq_secret);
 
     pub_key[..ed25519_dalek::PUBLIC_KEY_LENGTH].copy_from_slice(classic_public.as_bytes());
     pub_key[ed25519_dalek::PUBLIC_KEY_LENGTH..].copy_from_slice(&pq_public);

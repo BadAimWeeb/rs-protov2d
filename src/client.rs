@@ -359,8 +359,9 @@ impl BareClient {
                             return Err(Error::ServerKeyVerificationFailed);
                         }
 
-                        let result_pqc = pqc_dilithium::verify(signature_pq, full_exchange, pqcpk);
-                        if result_pqc.is_err() {
+                        let pqcpk = crystals_dilithium::dilithium5::PublicKey::from_bytes(pqcpk);
+                        let result_pqc = pqcpk.verify(full_exchange, signature_pq);
+                        if result_pqc == false {
                             return Err(Error::ServerKeyVerificationFailed);
                         }
                     }
@@ -394,16 +395,8 @@ impl BareClient {
                     let signature_session_classic = signature_session_classic.to_bytes();
 
                     let priv_session_pqc = &self.session.0[64..];
-                    let pub_session_pqc = &self.session.1[32..];
-                    let key_session_pqc = pqc_dilithium::Keypair::new(
-                        pub_session_pqc.to_vec(),
-                        priv_session_pqc.to_vec(),
-                    );
-                    if key_session_pqc.is_err() {
-                        return Err(Error::ExchangeError);
-                    }
-                    let key_session_pqc = key_session_pqc.ok();
-                    let key_session_pqc = key_session_pqc.unwrap();
+                    let key_session_pqc = crystals_dilithium::dilithium5::SecretKey::from_bytes(priv_session_pqc);
+
                     let signature_session_pqc = key_session_pqc.sign(random_challenge);
 
                     let mut response = vec![0x02u8, 0x03];
