@@ -6,9 +6,9 @@ use x25519_dalek::EphemeralSecret;
 
 use futures_util::{stream::FusedStream, FutureExt, Sink, SinkExt, Stream, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{tungstenite::{client::IntoClientRequest, Message}, MaybeTlsStream, WebSocketStream};
 
-use crate::utils::{self, aes_decrypt, aes_encrypt, PRIVATE_KEY_LENGTH, PUBLIC_KEY_LENGTH};
+use crate::utils::{self, aes_decrypt, aes_encrypt, generate_key, PRIVATE_KEY_LENGTH, PUBLIC_KEY_LENGTH};
 
 #[derive(PartialEq)]
 pub enum PublicKeyType {
@@ -39,10 +39,10 @@ pub enum Error {
 
 pub struct ProtoV2dPacket {
     pub qos: u8,
-    pub data: Vec<u8>
+    pub data: Vec<u8>,
 }
 
-pub struct BareClient {
+pub struct Client {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     session: ([u8; PRIVATE_KEY_LENGTH], [u8; PUBLIC_KEY_LENGTH]),
 
@@ -54,10 +54,12 @@ pub struct BareClient {
 
     qos1_track_in: HashMap<u64, bool>,
     qos1_track_out: HashMap<u64, Vec<u8>>,
+
+    terminated: bool,
     last_ping: u64
 }
 
-impl Stream for BareClient {
+impl Stream for Client {
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -66,11 +68,16 @@ impl Stream for BareClient {
             return Poll::Ready(None);
         }
 
-        if !self.ws.is_terminated() {
+        if self.terminated {
             return Poll::Ready(None);
         }
 
         if !self.encryption.is_none() {
+            return Poll::Ready(None);
+        }
+
+        // TODO this should not return None, we may attempt to reconnect here.
+        if !self.ws.is_terminated() {
             return Poll::Ready(None);
         }
 
@@ -108,14 +115,17 @@ impl Stream for BareClient {
                             match qos {
                                 0x00 => {
                                     let data = &data[1..];
-                                    return Poll::Ready(Some(ProtoV2dPacket { qos, data: data.to_vec() }));
+                                    return Poll::Ready(Some(ProtoV2dPacket {
+                                        qos,
+                                        data: data.to_vec(),
+                                    }));
                                 }
 
                                 0x01 => {
-                                    let dup_id = (u64::from(data[1]) << 24) |
-                                        (u64::from(data[2]) << 16) |
-                                        (u64::from(data[3]) << 8) |
-                                        u64::from(data[4]);
+                                    let dup_id = (u64::from(data[1]) << 24)
+                                        | (u64::from(data[2]) << 16)
+                                        | (u64::from(data[3]) << 8)
+                                        | u64::from(data[4]);
 
                                     let control = data[5];
 
@@ -129,7 +139,9 @@ impl Stream for BareClient {
                                             let t_data = &data[6..];
 
                                             let mut resp = vec![0x03u8];
-                                            let enc_part = vec![0x01u8, data[1], data[2], data[3], data[4], 0xFF];
+                                            let enc_part = vec![
+                                                0x01u8, data[1], data[2], data[3], data[4], 0xFF,
+                                            ];
                                             let enc_part = aes_encrypt(&k.0, &enc_part);
                                             if enc_part.is_err() {
                                                 return Poll::Ready(None);
@@ -146,7 +158,10 @@ impl Stream for BareClient {
 
                                             if !self.qos1_track_in.contains_key(&dup_id) {
                                                 self.qos1_track_in.insert(dup_id, true);
-                                                return Poll::Ready(Some(ProtoV2dPacket { qos, data: t_data.to_vec() }));
+                                                return Poll::Ready(Some(ProtoV2dPacket {
+                                                    qos,
+                                                    data: t_data.to_vec(),
+                                                }));
                                             }
 
                                             return Poll::Ready(None);
@@ -194,37 +209,96 @@ impl Stream for BareClient {
     type Item = ProtoV2dPacket;
 }
 
-impl Sink<ProtoV2dPacket> for BareClient {
+impl Sink<ProtoV2dPacket> for Client {
     type Error = Error;
 
     fn poll_ready(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        todo!()
+        self.ws
+            .poll_ready_unpin(cx)
+            .map_err(|_| Error::WebsocketError)
     }
 
-    fn start_send(self: std::pin::Pin<&mut Self>, item: ProtoV2dPacket) -> Result<(), Self::Error> {
-        todo!()
+    fn start_send(mut self: std::pin::Pin<&mut Self>, item: ProtoV2dPacket) -> Result<(), Self::Error> {
+        let k = self.encryption.as_ref().unwrap();
+
+        let mut data = vec![item.qos];
+        data.extend_from_slice(&item.data);
+
+        let mut resp = vec![0x03u8];
+        let enc_part = aes_encrypt(&k.0, &data);
+        if enc_part.is_err() {
+            return Err(Error::WebsocketError);
+        }
+
+        let enc_part = enc_part.unwrap();
+        let enc_part = aes_encrypt(&k.1, &enc_part);
+        if enc_part.is_err() {
+            return Err(Error::WebsocketError);
+        }
+
+        let enc_part = enc_part.unwrap();
+        resp.extend_from_slice(&enc_part);
+
+        self.ws.start_send_unpin(Message::binary(resp))
+            .map_err(|_| Error::WebsocketError)
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        todo!()
+        self.ws
+            .poll_flush_unpin(cx)
+            .map_err(|_| Error::WebsocketError)
     }
 
     fn poll_close(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        todo!()
+        let _ = self.ws.send(Message::binary(vec![0x05u8]));
+
+        self.ws
+            .poll_close_unpin(cx)
+            .map_err(|_| Error::WebsocketError)
     }
 }
 
-impl BareClient {
-    pub async fn handshake(&mut self) -> Result<(), Error> {
+impl Client {
+    pub async fn connect<R>(request: R, config: ClientHandshakeConfig) -> Result<Client, Error> 
+    where R: IntoClientRequest + Unpin
+    {
+        // TODO handle reconnection
+        let stream = tokio_tungstenite::connect_async(request).await;
+        if stream.is_err() {
+            return Err(Error::WebsocketError);
+        }
+
+        let stream = stream.unwrap();
+        let ws = stream.0;
+
+        let mut c = Client {
+            ws,
+            config,
+            encryption: None,
+            handshaked: false,
+            last_ping: 0,
+            qos1_track_in: HashMap::new(),
+            qos1_track_out: HashMap::new(),
+            session: generate_key(),
+            terminated: false,
+            track_count: 0
+        };
+
+        c.handshake().await?;
+
+        Ok(c)
+    }
+
+    async fn handshake(&mut self) -> Result<(), Error> {
         let no_verify = self
             .config
             .public_keys
@@ -395,7 +469,8 @@ impl BareClient {
                     let signature_session_classic = signature_session_classic.to_bytes();
 
                     let priv_session_pqc = &self.session.0[64..];
-                    let key_session_pqc = crystals_dilithium::dilithium5::SecretKey::from_bytes(priv_session_pqc);
+                    let key_session_pqc =
+                        crystals_dilithium::dilithium5::SecretKey::from_bytes(priv_session_pqc);
 
                     let signature_session_pqc = key_session_pqc.sign(random_challenge);
 
