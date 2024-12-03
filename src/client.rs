@@ -6,9 +6,14 @@ use x25519_dalek::EphemeralSecret;
 
 use futures_util::{stream::FusedStream, FutureExt, Sink, SinkExt, Stream, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{tungstenite::{client::IntoClientRequest, Message}, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    tungstenite::{client::IntoClientRequest, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 
-use crate::utils::{self, aes_decrypt, aes_encrypt, generate_key, PRIVATE_KEY_LENGTH, PUBLIC_KEY_LENGTH};
+use crate::utils::{
+    self, aes_decrypt, aes_encrypt, generate_key, PRIVATE_KEY_LENGTH, PUBLIC_KEY_LENGTH,
+};
 
 #[derive(PartialEq)]
 pub enum PublicKeyType {
@@ -35,11 +40,12 @@ pub enum Error {
     InvalidHandshakeVersion,
     ServerKeyVerificationFailed,
     ExchangeError,
-    CannotConnect
+    CannotConnect,
 }
 
 pub struct ProtoV2dPacket {
     pub qos: u8,
+    pub qos1_id: Option<u64>,
     pub data: Vec<u8>,
 }
 
@@ -53,8 +59,10 @@ pub struct Client {
     pub track_count: usize,
     pub config: ClientHandshakeConfig,
 
+    qos1_id: u64,
     qos1_track_in: HashMap<u64, bool>,
     qos1_track_out: HashMap<u64, Vec<u8>>,
+    qos1_callback: HashMap<u64, tokio::sync::oneshot::Sender<()>>,
 
     terminated: bool,
     last_ping: u64
@@ -118,6 +126,8 @@ impl Stream for Client {
                                     let data = &data[1..];
                                     return Poll::Ready(Some(ProtoV2dPacket {
                                         qos,
+                                        qos1_id: None,
+
                                         data: data.to_vec(),
                                     }));
                                 }
@@ -134,6 +144,10 @@ impl Stream for Client {
                                         0xFF => {
                                             // ACK
                                             self.qos1_track_out.remove(&dup_id);
+                                            
+                                            if self.qos1_callback.contains_key(&dup_id) {
+                                                let _ = self.qos1_callback.remove(&dup_id).unwrap().send(());
+                                            }
                                         }
                                         _ => {
                                             // Data
@@ -161,11 +175,10 @@ impl Stream for Client {
                                                 self.qos1_track_in.insert(dup_id, true);
                                                 return Poll::Ready(Some(ProtoV2dPacket {
                                                     qos,
+                                                    qos1_id: Some(dup_id),
                                                     data: t_data.to_vec(),
                                                 }));
                                             }
-
-                                            return Poll::Ready(None);
                                         }
                                     }
                                 }
@@ -222,10 +235,22 @@ impl Sink<ProtoV2dPacket> for Client {
             .map_err(|_| Error::WebsocketError)
     }
 
-    fn start_send(mut self: std::pin::Pin<&mut Self>, item: ProtoV2dPacket) -> Result<(), Self::Error> {
+    fn start_send(
+        mut self: std::pin::Pin<&mut Self>,
+        item: ProtoV2dPacket,
+    ) -> Result<(), Self::Error> {
         let k = self.encryption.as_ref().unwrap();
 
         let mut data = vec![item.qos];
+        if item.qos == 1 {
+            let qos = [
+                ((item.qos1_id.unwrap() >> 24) & 0xFF) as u8,
+                ((item.qos1_id.unwrap() >> 16) & 0xFF) as u8,
+                ((item.qos1_id.unwrap() >> 8) & 0xFF) as u8,
+                (item.qos1_id.unwrap() & 0xFF) as u8,
+            ];
+            data.extend_from_slice(&qos);
+        }
         data.extend_from_slice(&item.data);
 
         let mut resp = vec![0x03u8];
@@ -243,7 +268,8 @@ impl Sink<ProtoV2dPacket> for Client {
         let enc_part = enc_part.unwrap();
         resp.extend_from_slice(&enc_part);
 
-        self.ws.start_send_unpin(Message::binary(resp))
+        self.ws
+            .start_send_unpin(Message::binary(resp))
             .map_err(|_| Error::WebsocketError)
     }
 
@@ -269,8 +295,9 @@ impl Sink<ProtoV2dPacket> for Client {
 }
 
 impl Client {
-    pub async fn connect<R>(request: R, config: ClientHandshakeConfig) -> Result<Client, Error> 
-    where R: IntoClientRequest + Unpin
+    pub async fn connect<R>(request: R, config: ClientHandshakeConfig) -> Result<Client, Error>
+    where
+        R: IntoClientRequest + Unpin,
     {
         // TODO handle reconnection
         let stream = tokio_tungstenite::connect_async(request).await;
@@ -288,16 +315,67 @@ impl Client {
             encryption: None,
             handshaked: false,
             last_ping: 0,
+            qos1_id: 0,
             qos1_track_in: HashMap::new(),
             qos1_track_out: HashMap::new(),
+            qos1_callback: HashMap::new(),
             session: generate_key(),
             terminated: false,
-            track_count: 0
+            track_count: 0,
         };
 
         c.handshake().await?;
 
         Ok(c)
+    }
+
+    pub fn send(&mut self, qos: u8, data: Vec<u8>) {
+        match qos {
+            0x01 => {
+                // QoS1 packet
+                let send_id = (self.qos1_id << 1) | 1;
+                self.qos1_id += 1;
+
+                let packet = ProtoV2dPacket {
+                    qos,
+                    qos1_id: Some(send_id),
+                    data,
+                };
+
+                let mut pinned = std::pin::pin!(self);
+                pinned.as_mut().start_send(packet).unwrap();
+            }
+            _ => {
+                // QoS0 or custom implementation
+                let packet = ProtoV2dPacket {
+                    qos,
+                    qos1_id: None,
+                    data
+                };
+
+                let mut pinned = std::pin::pin!(self);
+                pinned.as_mut().start_send(packet).unwrap();
+            }
+        }
+    }
+
+    pub async fn send_qos1_with_ack(&mut self, data: Vec<u8>) {
+        let send_id = (self.qos1_id << 1) | 1;
+        self.qos1_id += 1;
+
+        let packet = ProtoV2dPacket {
+            qos: 0x01,
+            qos1_id: Some(send_id),
+            data,
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.qos1_callback.insert(send_id, tx);
+
+        let mut pinned = std::pin::pin!(self);
+        pinned.as_mut().start_send(packet).unwrap();
+
+        rx.await.unwrap();
     }
 
     async fn handshake(&mut self) -> Result<(), Error> {
