@@ -35,6 +35,7 @@ pub enum Error {
     InvalidHandshakeVersion,
     ServerKeyVerificationFailed,
     ExchangeError,
+    CannotConnect
 }
 
 pub struct ProtoV2dPacket {
@@ -274,7 +275,8 @@ impl Client {
         // TODO handle reconnection
         let stream = tokio_tungstenite::connect_async(request).await;
         if stream.is_err() {
-            return Err(Error::WebsocketError);
+            dbg!(stream.unwrap_err());
+            return Err(Error::CannotConnect);
         }
 
         let stream = stream.unwrap();
@@ -315,8 +317,11 @@ impl Client {
         };
 
         // Send the initial handshake
-        let init_handshake =
+        let mut init_handshake =
             rmp_serde::to_vec(&(1, 2, [2], if full_pk_only || no_verify { 0 } else { 1 })).unwrap();
+
+        init_handshake.insert(0, 0x02);
+
         let init_handshake_send = self.ws.send(Message::binary(init_handshake)).await;
         if init_handshake_send.is_err() {
             return Err(Error::WebsocketError);
@@ -336,6 +341,7 @@ impl Client {
 
             if let Some(Ok(msg)) = msg {
                 if msg.is_close() {
+                    dbg!("closed on first handshake packet");
                     return Err(Error::ConnectionClosed);
                 }
 
@@ -516,6 +522,7 @@ impl Client {
 
             if let Some(Ok(msg)) = msg {
                 if msg.is_close() {
+                    dbg!("closed on second handshake packet");
                     return Err(Error::ConnectionClosed);
                 }
 
