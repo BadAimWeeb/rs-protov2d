@@ -250,6 +250,7 @@ impl Sink<ProtoV2dPacket> for Client {
                 (item.qos1_id.unwrap() & 0xFF) as u8,
             ];
             data.extend_from_slice(&qos);
+            data.extend([0x00u8]);
         }
         data.extend_from_slice(&item.data);
 
