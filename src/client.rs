@@ -198,7 +198,12 @@ impl Stream for Client {
 
                                 let mut resp = vec![0x04u8, 0x01];
                                 resp.extend_from_slice(&d[2..]);
-                                let _ = self.ws.send(Message::binary(resp));
+                                match self.ws.send(Message::binary(resp)).poll_unpin(cx) {
+                                    Poll::Ready(_) => {}
+                                    Poll::Pending => {
+                                        return Poll::Pending;
+                                    }
+                                }
                             }
                             0x05 => {
                                 todo!("implement graceful closing");
