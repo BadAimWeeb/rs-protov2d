@@ -467,15 +467,15 @@ impl Client {
                             let kd = &kd.unwrap()[..];
                             if key.key_type == PublicKeyType::Key {
                                 // compute to hash and compare
-                                let s256 = &Sha256::digest(&kd);
-                                if utils::compare(&s256, pkh) != std::cmp::Ordering::Equal {
+                                let s256 = &Sha256::digest(&kd)[..];
+                                if utils::compare(&s256, pkh) == std::cmp::Ordering::Equal {
                                     Some(kd.to_vec())
                                 } else {
                                     None
                                 }
                             } else if key.key_type == PublicKeyType::Hash {
                                 // hash vs hash
-                                if utils::compare(&kd, pkh) != std::cmp::Ordering::Equal {
+                                if utils::compare(&kd, pkh) == std::cmp::Ordering::Equal {
                                     Some(pk.to_vec())
                                 } else {
                                     None

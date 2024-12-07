@@ -26,8 +26,8 @@ async fn connect() {
 
     let result = Client::connect("wss://id-backend.badaimweeb.me/", ClientHandshakeConfig {
         public_keys: vec![PublicKey {
-            key_type: PublicKeyType::NoVerify,
-            data: None
+            key_type: PublicKeyType::Hash,
+            data: Some("357093b00d1d5640aae631dd62519a88b29233274df4a23fd960432d8004ecb9".to_string())
         }],
         ping_interval: None
     }).await;
