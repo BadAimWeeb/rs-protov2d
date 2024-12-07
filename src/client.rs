@@ -190,7 +190,7 @@ impl Stream for Client {
                                                 let enc_part = enc_part.unwrap();
                                                 resp.extend_from_slice(&enc_part);
 
-                                                let _ = self.ws.send(Message::binary(resp));
+                                                let _ = self.ws.send(Message::binary(resp)).poll_unpin(cx);
 
                                                 if !self.qos1_track_in.contains_key(&dup_id) {
                                                     self.qos1_track_in.insert(dup_id, true);
