@@ -87,14 +87,14 @@ pub fn aes_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, &'static str> {
     let sha = &data[16..48];
     let enc = &data[48..];
 
-    let mut cipher = aes_gcm::AesGcm::<Aes256, U16>::new_from_slice(key).unwrap();
+    let mut cipher = aes_gcm::AesGcm::<Aes256, U16>::new_from_slice(key).map_err(|_| "cipher fault")?;
     let nonce = Nonce::<U16>::from_slice(iv);
 
     let tag = &enc[..16];
     let dec = &enc[16..];
     let mut dec = dec.to_vec();
 
-    cipher.decrypt_in_place_detached(nonce, &[0u8; 0], &mut dec, tag.into()).unwrap();
+    cipher.decrypt_in_place_detached(nonce, &[0u8; 0], &mut dec, tag.into()).map_err(|_| "decryption fault")?;
     
     let mut hasher = Sha256::new();
     hasher.update(&dec);
