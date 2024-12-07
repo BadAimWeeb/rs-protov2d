@@ -1,6 +1,7 @@
-use std::{collections::HashMap, task::Poll};
+use std::{collections::HashMap, task::Poll, time::Duration};
 
 use ed25519_dalek::ed25519::signature::SignerMut;
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use x25519_dalek::EphemeralSecret;
 
@@ -12,7 +13,7 @@ use tokio_tungstenite::{
 };
 
 use crate::utils::{
-    self, aes_decrypt, aes_encrypt, generate_key, PRIVATE_KEY_LENGTH, PUBLIC_KEY_LENGTH,
+    self, aes_decrypt, aes_encrypt, compare, generate_key, PRIVATE_KEY_LENGTH, PUBLIC_KEY_LENGTH,
 };
 
 #[derive(PartialEq)]
@@ -66,6 +67,7 @@ pub struct Client {
 
     terminated: bool,
     last_ping: u64,
+    last_ping_data: Option<[u8; 16]>,
 }
 
 impl Stream for Client {
@@ -89,6 +91,29 @@ impl Stream for Client {
             // TODO this should not return None, we may attempt to reconnect here.
             if self.ws.is_terminated() {
                 return Poll::Ready(None);
+            }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            if self.last_ping_data.is_some() {
+                if now - self.last_ping > 15 {
+                    return Poll::Ready(None);
+                }
+            } else {
+                if now - self.last_ping > self.config.ping_interval.unwrap_or_else(|| Duration::from_secs(15)).as_secs() {
+                    let mut data = [0u8; 16];
+                    rand::thread_rng().fill_bytes(&mut data);
+                    self.last_ping_data = Some(data);
+
+                    let mut resp = vec![0x04u8, 0x00];
+                    resp.extend_from_slice(&data);
+                    let _ = self.ws.send(Message::binary(resp)).poll_unpin(cx); // we don't care about the result
+
+                    self.last_ping = now;
+                }
             }
 
             match futures_util::ready!(self.ws.next().poll_unpin(cx)) {
@@ -192,16 +217,37 @@ impl Stream for Client {
                             }
                             0x04 => {
                                 // Ping
-                                if d[1] != 0x00 {
-                                    return Poll::Ready(None);
-                                }
+                                match d[1] {
+                                    0x00 => {
+                                        let mut resp = vec![0x04u8, 0x01];
+                                        resp.extend_from_slice(&d[2..]);
+                                        match self.ws.send(Message::binary(resp)).poll_unpin(cx) {
+                                            Poll::Ready(_) => {}
+                                            Poll::Pending => {
+                                                return Poll::Pending;
+                                            }
+                                        }
+                                    }
 
-                                let mut resp = vec![0x04u8, 0x01];
-                                resp.extend_from_slice(&d[2..]);
-                                match self.ws.send(Message::binary(resp)).poll_unpin(cx) {
-                                    Poll::Ready(_) => {}
-                                    Poll::Pending => {
-                                        return Poll::Pending;
+                                    0x01 => {
+                                        if self.last_ping_data.is_some() {
+                                            let data = &d[2..];
+                                            if data.len() != 16 {
+                                                return Poll::Ready(None);
+                                            }
+
+                                            if compare(data, self.last_ping_data.as_ref().unwrap())
+                                                != std::cmp::Ordering::Equal
+                                            {
+                                                return Poll::Ready(None);
+                                            }
+
+                                            self.last_ping_data = None;
+                                        }
+                                    }
+
+                                    _ => {
+                                        return Poll::Ready(None);
                                     }
                                 }
                             }
@@ -319,13 +365,14 @@ impl Client {
             encryption: None,
             handshaked: false,
             last_ping: 0,
+            last_ping_data: None,
             qos1_id: 0,
             qos1_track_in: HashMap::new(),
             qos1_track_out: HashMap::new(),
             qos1_callback: HashMap::new(),
             session: generate_key(),
             terminated: false,
-            track_count: 0,
+            track_count: 0,            
         };
 
         c.handshake().await?;
@@ -338,7 +385,7 @@ impl Client {
         match qos {
             0x01 => {
                 // QoS1 packet
-                let send_id = (self.qos1_id << 1) | 1;
+                let send_id = self.qos1_id << 1;
                 self.qos1_id += 1;
 
                 let packet = ProtoV2dPacket {
@@ -366,7 +413,7 @@ impl Client {
 
     /// Send QoS1 packet, awaiting ACK from server.
     pub async fn send_packet_qos1_with_ack(&mut self, data: Vec<u8>) {
-        let send_id = (self.qos1_id << 1) | 1;
+        let send_id = self.qos1_id << 1;
         self.qos1_id += 1;
 
         let packet = ProtoV2dPacket {
