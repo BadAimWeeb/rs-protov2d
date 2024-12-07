@@ -81,12 +81,12 @@ impl Stream for Client {
             return Poll::Ready(None);
         }
 
-        if !self.encryption.is_none() {
+        if self.encryption.is_none() {
             return Poll::Ready(None);
         }
 
         // TODO this should not return None, we may attempt to reconnect here.
-        if !self.ws.is_terminated() {
+        if self.ws.is_terminated() {
             return Poll::Ready(None);
         }
 
