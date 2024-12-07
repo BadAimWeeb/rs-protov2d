@@ -329,7 +329,8 @@ impl Client {
         Ok(c)
     }
 
-    pub fn send(&mut self, qos: u8, data: Vec<u8>) {
+    /// Send packet without awaiting ACK. Flushing still needs to be done.
+    pub async fn send_packet(&mut self, qos: u8, data: Vec<u8>) {
         match qos {
             0x01 => {
                 // QoS1 packet
@@ -343,7 +344,7 @@ impl Client {
                 };
 
                 let mut pinned = std::pin::pin!(self);
-                pinned.as_mut().start_send(packet).unwrap();
+                let _ = pinned.as_mut().send(packet).await;
             }
             _ => {
                 // QoS0 or custom implementation
@@ -354,12 +355,13 @@ impl Client {
                 };
 
                 let mut pinned = std::pin::pin!(self);
-                pinned.as_mut().start_send(packet).unwrap();
+                let _ = pinned.as_mut().send(packet).await;
             }
         }
     }
 
-    pub async fn send_qos1_with_ack(&mut self, data: Vec<u8>) {
+    /// Send QoS1 packet, awaiting ACK from server.
+    pub async fn send_packet_qos1_with_ack(&mut self, data: Vec<u8>) {
         let send_id = (self.qos1_id << 1) | 1;
         self.qos1_id += 1;
 
@@ -373,7 +375,7 @@ impl Client {
         self.qos1_callback.insert(send_id, tx);
 
         let mut pinned = std::pin::pin!(self);
-        pinned.as_mut().start_send(packet).unwrap();
+        let _ = pinned.as_mut().send(packet).await;
 
         rx.await.unwrap();
     }
