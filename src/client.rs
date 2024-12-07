@@ -65,7 +65,7 @@ pub struct Client {
     qos1_callback: HashMap<u64, tokio::sync::oneshot::Sender<()>>,
 
     terminated: bool,
-    last_ping: u64
+    last_ping: u64,
 }
 
 impl Stream for Client {
@@ -73,149 +73,147 @@ impl Stream for Client {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        if !self.handshaked {
-            return Poll::Ready(None);
-        }
+        loop {
+            if !self.handshaked {
+                return Poll::Ready(None);
+            }
 
-        if self.terminated {
-            return Poll::Ready(None);
-        }
+            if self.terminated {
+                return Poll::Ready(None);
+            }
 
-        if self.encryption.is_none() {
-            return Poll::Ready(None);
-        }
+            if self.encryption.is_none() {
+                return Poll::Ready(None);
+            }
 
-        // TODO this should not return None, we may attempt to reconnect here.
-        if self.ws.is_terminated() {
-            return Poll::Ready(None);
-        }
+            // TODO this should not return None, we may attempt to reconnect here.
+            if self.ws.is_terminated() {
+                return Poll::Ready(None);
+            }
 
-        match futures_util::ready!(self.ws.next().poll_unpin(cx)) {
-            Some(Ok(msg)) => {
-                if msg.is_close() {
-                    return Poll::Ready(None);
-                }
+            match futures_util::ready!(self.ws.next().poll_unpin(cx)) {
+                Some(Ok(msg)) => {
+                    if msg.is_close() {
+                        return Poll::Ready(None);
+                    }
 
-                if msg.is_binary() || msg.is_text() {
-                    let d = msg.into_data();
+                    if msg.is_binary() || msg.is_text() {
+                        let d = msg.into_data();
 
-                    match d[0] {
-                        0x03 => {
-                            // Data packet
-                            let k = self.encryption.as_ref().unwrap();
+                        match d[0] {
+                            0x03 => {
+                                // Data packet
+                                let k = self.encryption.as_ref().unwrap();
 
-                            let enc_data = &d[1..];
-                            let data = aes_decrypt(&k.1, enc_data);
-                            if data.is_err() {
-                                return Poll::Ready(None);
-                            }
-
-                            let data = data.unwrap();
-                            let data = aes_decrypt(&k.0, &data);
-
-                            if data.is_err() {
-                                return Poll::Ready(None);
-                            }
-
-                            let data = data.unwrap();
-                            let data = data.as_slice();
-
-                            let qos = data[0];
-                            match qos {
-                                0x00 => {
-                                    let data = &data[1..];
-                                    return Poll::Ready(Some(ProtoV2dPacket {
-                                        qos,
-                                        qos1_id: None,
-
-                                        data: data.to_vec(),
-                                    }));
+                                let enc_data = &d[1..];
+                                let data = aes_decrypt(&k.1, enc_data);
+                                if data.is_err() {
+                                    continue;
                                 }
 
-                                0x01 => {
-                                    let dup_id = (u64::from(data[1]) << 24)
-                                        | (u64::from(data[2]) << 16)
-                                        | (u64::from(data[3]) << 8)
-                                        | u64::from(data[4]);
+                                let data = data.unwrap();
+                                let data = aes_decrypt(&k.0, &data);
 
-                                    let control = data[5];
+                                if data.is_err() {
+                                    continue;
+                                }
 
-                                    match control {
-                                        0xFF => {
-                                            // ACK
-                                            self.qos1_track_out.remove(&dup_id);
-                                            
-                                            if self.qos1_callback.contains_key(&dup_id) {
-                                                let _ = self.qos1_callback.remove(&dup_id).unwrap().send(());
+                                let data = data.unwrap();
+                                let data = data.as_slice();
+
+                                let qos = data[0];
+                                match qos {
+                                    0x01 => {
+                                        let dup_id = (u64::from(data[1]) << 24)
+                                            | (u64::from(data[2]) << 16)
+                                            | (u64::from(data[3]) << 8)
+                                            | u64::from(data[4]);
+
+                                        let control = data[5];
+
+                                        match control {
+                                            0xFF => {
+                                                // ACK
+                                                self.qos1_track_out.remove(&dup_id);
+
+                                                if self.qos1_callback.contains_key(&dup_id) {
+                                                    let _ = self
+                                                        .qos1_callback
+                                                        .remove(&dup_id)
+                                                        .unwrap()
+                                                        .send(());
+                                                }
                                             }
-                                        }
-                                        _ => {
-                                            // Data
-                                            let t_data = &data[6..];
+                                            _ => {
+                                                // Data
+                                                let t_data = &data[6..];
 
-                                            let mut resp = vec![0x03u8];
-                                            let enc_part = vec![
-                                                0x01u8, data[1], data[2], data[3], data[4], 0xFF,
-                                            ];
-                                            let enc_part = aes_encrypt(&k.0, &enc_part);
-                                            if enc_part.is_err() {
-                                                return Poll::Ready(None);
-                                            }
-                                            let enc_part = enc_part.unwrap();
-                                            let enc_part = aes_encrypt(&k.1, &enc_part);
-                                            if enc_part.is_err() {
-                                                return Poll::Ready(None);
-                                            }
-                                            let enc_part = enc_part.unwrap();
-                                            resp.extend_from_slice(&enc_part);
+                                                let mut resp = vec![0x03u8];
+                                                let enc_part = vec![
+                                                    0x01u8, data[1], data[2], data[3], data[4],
+                                                    0xFF,
+                                                ];
+                                                let enc_part = aes_encrypt(&k.0, &enc_part);
+                                                if enc_part.is_err() {
+                                                    return Poll::Ready(None);
+                                                }
+                                                let enc_part = enc_part.unwrap();
+                                                let enc_part = aes_encrypt(&k.1, &enc_part);
+                                                if enc_part.is_err() {
+                                                    return Poll::Ready(None);
+                                                }
+                                                let enc_part = enc_part.unwrap();
+                                                resp.extend_from_slice(&enc_part);
 
-                                            let _ = self.ws.send(Message::binary(resp));
+                                                let _ = self.ws.send(Message::binary(resp));
 
-                                            if !self.qos1_track_in.contains_key(&dup_id) {
-                                                self.qos1_track_in.insert(dup_id, true);
-                                                return Poll::Ready(Some(ProtoV2dPacket {
-                                                    qos,
-                                                    qos1_id: Some(dup_id),
-                                                    data: t_data.to_vec(),
-                                                }));
+                                                if !self.qos1_track_in.contains_key(&dup_id) {
+                                                    self.qos1_track_in.insert(dup_id, true);
+                                                    return Poll::Ready(Some(ProtoV2dPacket {
+                                                        qos,
+                                                        qos1_id: Some(dup_id),
+                                                        data: t_data.to_vec(),
+                                                    }));
+                                                }
                                             }
                                         }
                                     }
-                                }
 
-                                _ => {
+                                    _ => {
+                                        let data = &data[1..];
+                                        return Poll::Ready(Some(ProtoV2dPacket {
+                                            qos,
+                                            qos1_id: None,
+
+                                            data: data.to_vec(),
+                                        }));
+                                    }
+                                }
+                            }
+                            0x04 => {
+                                // Ping
+                                if d[1] != 0x00 {
                                     return Poll::Ready(None);
                                 }
-                            }
-                        }
-                        0x04 => {
-                            // Ping
-                            if d[1] != 0x00 {
-                                return Poll::Ready(None);
-                            }
 
-                            let mut resp = vec![0x04u8, 0x01];
-                            resp.extend_from_slice(&d[2..]);
-                            let _ = self.ws.send(Message::binary(resp));
-
-                            return Poll::Ready(None);
-                        }
-                        0x05 => {
-                            todo!("implement graceful closing");
-                        }
-                        _ => {
-                            return Poll::Ready(None);
+                                let mut resp = vec![0x04u8, 0x01];
+                                resp.extend_from_slice(&d[2..]);
+                                let _ = self.ws.send(Message::binary(resp));
+                            }
+                            0x05 => {
+                                todo!("implement graceful closing");
+                            }
+                            _ => {}
                         }
                     }
                 }
-
-                return Poll::Ready(None);
-            }
-            Some(Err(_)) => {
-                return Poll::Ready(None);
-            }
-            None => {
-                return Poll::Ready(None);
+                Some(Err(e)) => {
+                    dbg!(e);
+                    return Poll::Ready(None);
+                }
+                None => {
+                    return Poll::Ready(None);
+                }
             }
         }
     }
@@ -352,7 +350,7 @@ impl Client {
                 let packet = ProtoV2dPacket {
                     qos,
                     qos1_id: None,
-                    data
+                    data,
                 };
 
                 let mut pinned = std::pin::pin!(self);

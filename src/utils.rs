@@ -66,8 +66,7 @@ pub fn aes_encrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
 
     let mut enc = data.to_vec();
     let tag = cipher.encrypt_in_place_detached(nonce, &[0u8; 0], &mut enc)?;
-    // tag is specified as 128-bit length, truncate
-    let tag = &tag[..16];
+    let tag = &tag[..];
     enc.extend_from_slice(tag);
 
     let mut hasher = Sha256::new();
@@ -85,13 +84,12 @@ pub fn aes_encrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
 pub fn aes_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, &'static str> {
     let iv = &data[..16];
     let sha = &data[16..48];
-    let enc = &data[48..];
 
     let mut cipher = aes_gcm::AesGcm::<Aes256, U16>::new_from_slice(key).map_err(|_| "cipher fault")?;
     let nonce = Nonce::<U16>::from_slice(iv);
 
-    let tag = &enc[..16];
-    let dec = &enc[16..];
+    let tag = &data[(data.len() - 16)..];
+    let dec = &data[48..(data.len() - 16)];
     let mut dec = dec.to_vec();
 
     cipher.decrypt_in_place_detached(nonce, &[0u8; 0], &mut dec, tag.into()).map_err(|_| "decryption fault")?;
