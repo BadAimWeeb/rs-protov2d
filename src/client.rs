@@ -1,4 +1,4 @@
-use std::{collections::HashMap, future::Future, task::Poll, time::Duration};
+use std::{collections::HashMap, task::Poll, time::Duration};
 
 use ed25519_dalek::ed25519::signature::SignerMut;
 use rand::{RngCore, SeedableRng};
@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::EphemeralSecret;
 
 use futures_util::{stream::FusedStream, FutureExt, Sink, SinkExt, Stream, StreamExt};
-use tokio::{net::TcpStream, pin};
+use tokio::net::TcpStream;
 use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, Message},
     MaybeTlsStream, WebSocketStream,
@@ -42,7 +42,7 @@ pub enum Error {
     ServerKeyVerificationFailed,
     ExchangeError,
     CannotConnect,
-    ReconnectionNotPossible
+    ReconnectionNotPossible,
 }
 
 pub struct ProtoV2dPacket {
@@ -52,7 +52,8 @@ pub struct ProtoV2dPacket {
 }
 
 pub struct Client<R>
-where R: IntoClientRequest + Unpin + Copy
+where
+    R: IntoClientRequest + Unpin + Copy,
 {
     dial_target_reconnect: Option<R>,
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -69,7 +70,6 @@ where R: IntoClientRequest + Unpin + Copy
     qos1_track_out: HashMap<u64, Vec<u8>>,
     qos1_callback: HashMap<u64, tokio::sync::oneshot::Sender<()>>,
 
-    terminated: bool,
     last_ping: u64,
     last_ping_data: Option<[u8; 16]>,
 }
@@ -83,35 +83,18 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         loop {
-            if !self.handshaked {
+            if self.ws.is_terminated() {
+                self.handshaked = false;
+                self.encryption = None;
                 return Poll::Ready(None);
             }
 
-            if self.terminated {
+            if !self.handshaked {
                 return Poll::Ready(None);
             }
 
             if self.encryption.is_none() {
                 return Poll::Ready(None);
-            }
-
-            // Reconnect if WS is terminated
-            // (honesty i don't know what i'm doing anymore)
-            if self.ws.is_terminated() {
-                if self.dial_target_reconnect.is_none() {
-                    return Poll::Ready(None);
-                }
-
-                let future = self.on_reconnect_needed();
-                pin!(future);
-                loop {
-                    match future.as_mut().poll(cx) {
-                        Poll::Ready(_) => {
-                            break;
-                        },
-                        _ => {}
-                    }
-                }
             }
 
             let now = std::time::SystemTime::now()
@@ -124,7 +107,13 @@ where
                     return Poll::Ready(None);
                 }
             } else {
-                if now - self.last_ping > self.config.ping_interval.unwrap_or_else(|| Duration::from_secs(15)).as_secs() {
+                if now - self.last_ping
+                    > self
+                        .config
+                        .ping_interval
+                        .unwrap_or_else(|| Duration::from_secs(15))
+                        .as_secs()
+                {
                     let mut data = [0u8; 16];
                     rand::rngs::StdRng::from_entropy().fill_bytes(&mut data);
                     self.last_ping_data = Some(data);
@@ -211,7 +200,10 @@ where
                                                 let enc_part = enc_part.unwrap();
                                                 resp.extend_from_slice(&enc_part);
 
-                                                let _ = self.ws.send(Message::binary(resp)).poll_unpin(cx);
+                                                let _ = self
+                                                    .ws
+                                                    .send(Message::binary(resp))
+                                                    .poll_unpin(cx);
 
                                                 if !self.qos1_track_in.contains_key(&dup_id) {
                                                     self.qos1_track_in.insert(dup_id, true);
@@ -368,10 +360,14 @@ where
     }
 }
 
-impl<R> Client<R> 
-where R: IntoClientRequest + Unpin + Copy
+impl<R> Client<R>
+where
+    R: IntoClientRequest + Unpin + Copy,
 {
-    async fn connect_ws(request: R) -> Result<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Error> {
+    async fn connect_ws(
+        request: R,
+    ) -> Result<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Error>
+    {
         let stream = tokio_tungstenite::connect_async(request).await;
         if stream.is_err() {
             dbg!(stream.unwrap_err());
@@ -382,16 +378,42 @@ where R: IntoClientRequest + Unpin + Copy
         Ok(stream.0)
     }
 
-    async fn on_reconnect_needed(&mut self) -> Result<(), Error> {
+    pub fn is_terminated(&self) -> bool {
+        self.ws.is_terminated()
+    }
+
+    pub async fn terminate(&mut self) {
+        let _ = self.ws.close(None).await;
+    }
+
+    pub async fn try_reconnect(&mut self) -> Result<bool, Error> {
+        if !self.ws.is_terminated() {
+            return Ok(false);
+        }
+
         if self.dial_target_reconnect.is_none() {
             return Err(Error::ReconnectionNotPossible);
         }
 
         let ws = Client::connect_ws(self.dial_target_reconnect.unwrap()).await?;
         self.ws = ws;
-        self.handshake().await?;
 
-        Ok(())
+        let old_cid = self.track_count;
+        self.last_ping = 0;
+        self.last_ping_data = None;
+        self.handshake().await?;
+        let new_cid = self.track_count;
+
+        if old_cid != new_cid {
+            // welp, server might have dropped our connection, or the server is a different one.
+            self.qos1_id = 0;
+            self.qos1_track_in.clear();
+            self.qos1_track_out.clear();
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub async fn connect(request: R, config: ClientHandshakeConfig) -> Result<Client<R>, Error>
@@ -413,8 +435,7 @@ where R: IntoClientRequest + Unpin + Copy
             qos1_track_out: HashMap::new(),
             qos1_callback: HashMap::new(),
             session: generate_key(),
-            terminated: false,
-            track_count: 0,            
+            track_count: 0,
         };
 
         c.handshake().await?;
