@@ -1,4 +1,4 @@
-use std::{collections::HashMap, task::Poll, time::Duration};
+use std::{collections::HashMap, future::Future, task::Poll, time::Duration};
 
 use ed25519_dalek::ed25519::signature::SignerMut;
 use rand::{RngCore, SeedableRng};
@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::EphemeralSecret;
 
 use futures_util::{stream::FusedStream, FutureExt, Sink, SinkExt, Stream, StreamExt};
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, pin};
 use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, Message},
     MaybeTlsStream, WebSocketStream,
@@ -42,6 +42,7 @@ pub enum Error {
     ServerKeyVerificationFailed,
     ExchangeError,
     CannotConnect,
+    ReconnectionNotPossible
 }
 
 pub struct ProtoV2dPacket {
@@ -50,7 +51,10 @@ pub struct ProtoV2dPacket {
     pub data: Vec<u8>,
 }
 
-pub struct Client {
+pub struct Client<R>
+where R: IntoClientRequest + Unpin + Copy
+{
+    dial_target_reconnect: Option<R>,
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     session: ([u8; PRIVATE_KEY_LENGTH], [u8; PUBLIC_KEY_LENGTH]),
 
@@ -70,7 +74,10 @@ pub struct Client {
     last_ping_data: Option<[u8; 16]>,
 }
 
-impl Stream for Client {
+impl<R> Stream for Client<R>
+where
+    R: IntoClientRequest + Unpin + Copy,
+{
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -88,9 +95,23 @@ impl Stream for Client {
                 return Poll::Ready(None);
             }
 
-            // TODO this should not return None, we may attempt to reconnect here.
+            // Reconnect if WS is terminated
+            // (honesty i don't know what i'm doing anymore)
             if self.ws.is_terminated() {
-                return Poll::Ready(None);
+                if self.dial_target_reconnect.is_none() {
+                    return Poll::Ready(None);
+                }
+
+                let future = self.on_reconnect_needed();
+                pin!(future);
+                loop {
+                    match future.as_mut().poll(cx) {
+                        Poll::Ready(_) => {
+                            break;
+                        },
+                        _ => {}
+                    }
+                }
             }
 
             let now = std::time::SystemTime::now()
@@ -272,7 +293,10 @@ impl Stream for Client {
     type Item = ProtoV2dPacket;
 }
 
-impl Sink<ProtoV2dPacket> for Client {
+impl<R> Sink<ProtoV2dPacket> for Client<R>
+where
+    R: IntoClientRequest + Unpin + Copy,
+{
     type Error = Error;
 
     fn poll_ready(
@@ -344,12 +368,10 @@ impl Sink<ProtoV2dPacket> for Client {
     }
 }
 
-impl Client {
-    pub async fn connect<R>(request: R, config: ClientHandshakeConfig) -> Result<Client, Error>
-    where
-        R: IntoClientRequest + Unpin,
-    {
-        // TODO handle reconnection
+impl<R> Client<R> 
+where R: IntoClientRequest + Unpin + Copy
+{
+    async fn connect_ws(request: R) -> Result<WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Error> {
         let stream = tokio_tungstenite::connect_async(request).await;
         if stream.is_err() {
             dbg!(stream.unwrap_err());
@@ -357,9 +379,29 @@ impl Client {
         }
 
         let stream = stream.unwrap();
-        let ws = stream.0;
+        Ok(stream.0)
+    }
+
+    async fn on_reconnect_needed(&mut self) -> Result<(), Error> {
+        if self.dial_target_reconnect.is_none() {
+            return Err(Error::ReconnectionNotPossible);
+        }
+
+        let ws = Client::connect_ws(self.dial_target_reconnect.unwrap()).await?;
+        self.ws = ws;
+        self.handshake().await?;
+
+        Ok(())
+    }
+
+    pub async fn connect(request: R, config: ClientHandshakeConfig) -> Result<Client<R>, Error>
+    where
+        R: IntoClientRequest + Unpin + Copy,
+    {
+        let ws = Client::connect_ws(request).await?;
 
         let mut c = Client {
+            dial_target_reconnect: Some(request),
             ws,
             config,
             encryption: None,
