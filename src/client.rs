@@ -1,7 +1,7 @@
 use std::{collections::HashMap, task::Poll, time::Duration};
 
 use ed25519_dalek::ed25519::signature::SignerMut;
-use rand::RngCore;
+use rand::{RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
 use x25519_dalek::EphemeralSecret;
 
@@ -105,7 +105,7 @@ impl Stream for Client {
             } else {
                 if now - self.last_ping > self.config.ping_interval.unwrap_or_else(|| Duration::from_secs(15)).as_secs() {
                     let mut data = [0u8; 16];
-                    rand::thread_rng().fill_bytes(&mut data);
+                    rand::rngs::StdRng::from_entropy().fill_bytes(&mut data);
                     self.last_ping_data = Some(data);
 
                     let mut resp = vec![0x04u8, 0x00];
@@ -577,7 +577,7 @@ impl Client {
                         }
                     }
 
-                    let mut rng = rand::thread_rng();
+                    let mut rng = rand::rngs::StdRng::from_entropy();
                     let pq_data = pqc_kyber::encapsulate(exchange_pq, &mut rng);
 
                     if pq_data.is_err() {

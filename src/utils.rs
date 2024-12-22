@@ -5,7 +5,7 @@ use aes_gcm::aead::generic_array::typenum::U16;
 use aes_gcm::aead::AeadMutInPlace;
 use aes_gcm::Nonce;
 use aes_gcm::{aes::Aes256, KeyInit};
-use rand::RngCore;
+use rand::{RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
 
 // https://codereview.stackexchange.com/a/233876
@@ -28,12 +28,14 @@ pub const PUBLIC_KEY_LENGTH: usize =
     ed25519_dalek::PUBLIC_KEY_LENGTH + crystals_dilithium::dilithium5::PUBLICKEYBYTES;
 
 pub fn generate_key() -> ([u8; PRIVATE_KEY_LENGTH], [u8; PUBLIC_KEY_LENGTH]) {
+    let mut rng = rand::rngs::StdRng::from_entropy();
+
     let mut pq_seed = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut pq_seed);
+    rng.fill_bytes(&mut pq_seed);
     let pq = crystals_dilithium::dilithium5::Keypair::generate(Some(&pq_seed));
 
     let mut classic_seed = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut classic_seed);
+    rng.fill_bytes(&mut classic_seed);
     let classic_sign = ed25519_dalek::SigningKey::from_bytes(&classic_seed);
     let classic_public = classic_sign.verifying_key();
 
@@ -58,7 +60,7 @@ pub fn generate_key() -> ([u8; PRIVATE_KEY_LENGTH], [u8; PUBLIC_KEY_LENGTH]) {
 
 pub fn aes_encrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
     let mut iv = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut iv);
+    rand::rngs::StdRng::from_entropy().fill_bytes(&mut iv);
 
     // JS implementation uses a 16-byte (128-bit) IV:
     let mut cipher = aes_gcm::AesGcm::<Aes256, U16>::new_from_slice(key).map_err(|_| aes_gcm::Error)?;
