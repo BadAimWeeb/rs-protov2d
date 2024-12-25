@@ -271,8 +271,7 @@ where
                         }
                     }
                 }
-                Some(Err(e)) => {
-                    dbg!(e);
+                Some(Err(_)) => {
                     return Poll::Ready(None);
                 }
                 None => {
@@ -370,7 +369,6 @@ where
     {
         let stream = tokio_tungstenite::connect_async(request).await;
         if stream.is_err() {
-            dbg!(stream.unwrap_err());
             return Err(Error::CannotConnect);
         }
 
@@ -535,7 +533,6 @@ where
 
             if let Some(Ok(msg)) = msg {
                 if msg.is_close() {
-                    dbg!("closed on first handshake packet");
                     return Err(Error::ConnectionClosed);
                 }
 
@@ -716,7 +713,6 @@ where
 
             if let Some(Ok(msg)) = msg {
                 if msg.is_close() {
-                    dbg!("closed on second handshake packet");
                     return Err(Error::ConnectionClosed);
                 }
 
